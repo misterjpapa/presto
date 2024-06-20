@@ -22,13 +22,18 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.Test;
 
+import java.util.List;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.facebook.presto.SystemSessionProperties.CTE_FILTER_AND_PROJECTION_PUSHDOWN_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.PUSHDOWN_SUBFIELDS_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.QUERY_MAX_WRITTEN_INTERMEDIATE_BYTES;
+import static com.facebook.presto.SystemSessionProperties.VERBOSE_OPTIMIZER_INFO_ENABLED;
 import static com.facebook.presto.testing.assertions.Assert.assertEquals;
+import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.airlift.tpch.TpchTable.CUSTOMER;
 import static io.airlift.tpch.TpchTable.LINE_ITEM;
 import static io.airlift.tpch.TpchTable.NATION;
@@ -37,11 +42,15 @@ import static io.airlift.tpch.TpchTable.PART;
 import static io.airlift.tpch.TpchTable.PART_SUPPLIER;
 import static io.airlift.tpch.TpchTable.REGION;
 import static io.airlift.tpch.TpchTable.SUPPLIER;
+import static java.lang.String.format;
+import static org.testng.Assert.assertTrue;
 
 @Test(singleThreaded = true)
 public class TestCteExecution
         extends AbstractTestQueryFramework
 {
+    private static final Pattern CTE_INFO_MATCHER = Pattern.compile("CTEInfo.*");
+
     @Override
     protected QueryRunner createQueryRunner()
             throws Exception
@@ -65,10 +74,8 @@ public class TestCteExecution
                 " b AS ((SELECT orderkey FROM t) UNION (SELECT orderkey FROM t1)) " +
                 "SELECT * FROM b";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        sql),
-                queryRunner.execute(getSession(),
-                        sql));
+        verifyResults(queryRunner, sql, ImmutableList.of(new CTEInfoValue("t", 1, false),
+                new CTEInfoValue("t1", 1, false), new CTEInfoValue("b", 1, false)));
     }
 
     @Test
@@ -77,22 +84,16 @@ public class TestCteExecution
         String sql = "WITH t as(SELECT * FROM orders LEFT JOIN (select orderkey from orders where false) ON TRUE) " +
                 "SELECT * FROM t";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        sql),
-                queryRunner.execute(getSession(),
-                        sql));
+        verifyResults(queryRunner, sql, ImmutableList.of(new CTEInfoValue("t", 1, false)));
     }
 
     @Test
     public void testSimplePersistentCte()
     {
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        "WITH  temp as (SELECT orderkey FROM ORDERS) " +
-                                "SELECT * FROM temp t1 "),
-                queryRunner.execute(getSession(),
-                        "WITH  temp as (SELECT orderkey FROM ORDERS) " +
-                                "SELECT * FROM temp t1 "));
+        String sql = "WITH  temp as (SELECT orderkey FROM ORDERS) " +
+                "SELECT * FROM temp t1 ";
+        verifyResults(queryRunner, sql, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
     }
 
     @Test
@@ -107,10 +108,7 @@ public class TestCteExecution
                 ")" +
                 "SELECT ts FROM cte";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -169,14 +167,18 @@ public class TestCteExecution
                 "  LEFT JOIN high on low.datestr = high.datestr" +
                 " ORDER BY\n" +
                 "    ofin.order_key\n";
-        compareResults(queryRunner.execute(Session.builder(super.getSession())
-                                .setSystemProperty(PUSHDOWN_SUBFIELDS_ENABLED, "true")
-                                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC_COMPLEX_QUERIES_ONLY")
-                                .setSystemProperty(CTE_FILTER_AND_PROJECTION_PUSHDOWN_ENABLED, "true")
-                                .build(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        Session materializedSession = Session.builder(super.getSession())
+                .setSystemProperty(VERBOSE_OPTIMIZER_INFO_ENABLED, "true")
+                .setSystemProperty(PUSHDOWN_SUBFIELDS_ENABLED, "true")
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC_COMPLEX_QUERIES_ONLY")
+                .setSystemProperty(CTE_FILTER_AND_PROJECTION_PUSHDOWN_ENABLED, "true")
+                .build();
+        verifyResults(materializedSession, getSession(), queryRunner, testQuery,
+                ImmutableList.of(new CTEInfoValue("order_platform_data", 4, false),
+                       new CTEInfoValue("urgent", 1, false),
+                       new CTEInfoValue("medium", 1, false),
+                       new CTEInfoValue("high", 1, false),
+                       new CTEInfoValue("low", 1, false)));
     }
 
     @Test
@@ -189,10 +191,7 @@ public class TestCteExecution
                 "  ) AS t (order_details, orderkey)" +
                 ") SELECT * FROM temp";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
     }
 
     // ToDo prestodb/21791: write with 0 length varchar fails in hive
@@ -206,10 +205,7 @@ public class TestCteExecution
                 "  ) AS t (text_column, number_column)" +
                 ") SELECT * FROM temp";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
     }
 
     @Test
@@ -219,9 +215,7 @@ public class TestCteExecution
                 "      cte2 AS (SELECT * FROM cte1 WHERE orderkey > 50) " +
                 "SELECT * FROM cte2";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false)));
     }
 
     @Test
@@ -231,9 +225,7 @@ public class TestCteExecution
                 "      cte2 AS (SELECT custkey FROM CUSTOMER WHERE custkey < 50) " +
                 "SELECT * FROM cte1, cte2 WHERE cte1.orderkey = cte2.custkey";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false)));
     }
 
     @Test
@@ -245,9 +237,7 @@ public class TestCteExecution
                 "        SELECT orderkey FROM cte2 WHERE orderkey > 50)" +
                 ") SELECT * FROM cte1";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false)));
     }
 
     @Test
@@ -258,9 +248,8 @@ public class TestCteExecution
                 " cte2 AS (SELECT * FROM customer WHERE custkey < 50) " +
                 "SELECT * FROM cte2  JOIN cte1 ON true";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false),
+                new CTEInfoValue("cte2", 1, false)));
     }
 
     @Test
@@ -280,9 +269,7 @@ public class TestCteExecution
                 "SELECT  CONCAT(text_column , 'XYZ') FROM test_cte\n" +
                 ")\n";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("test_cte", 1, false)));
     }
 
     @Test
@@ -297,10 +284,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -315,10 +299,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -333,10 +314,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -351,10 +329,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -369,10 +344,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -387,10 +359,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -405,10 +374,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -423,10 +389,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -441,10 +404,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -459,10 +419,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -477,10 +434,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -494,10 +448,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
 
     @Test
@@ -511,9 +462,7 @@ public class TestCteExecution
                 ")\n" +
                 "SELECT * FROM dataset";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("dataset", 1, false)));
     }
     @Test
     public void testComplexRefinedCtesOutsideScope()
@@ -531,9 +480,9 @@ public class TestCteExecution
                 ") " +
                 "SELECT cte3.*, cte2.orderkey FROM cte3 JOIN cte2 ON cte3.custkey = cte2.orderkey";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false),
+                new CTEInfoValue("cte2", 1, false),
+                new CTEInfoValue("cte3", 1, false)));
     }
 
     @Test
@@ -544,9 +493,9 @@ public class TestCteExecution
                 "     cte3 AS (SELECT orderkey FROM cte2 WHERE orderkey < 75) " +
                 "SELECT * FROM cte3";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false),
+                new CTEInfoValue("cte2", 1, false),
+                new CTEInfoValue("cte3", 1, false)));
     }
 
     @Test
@@ -557,9 +506,7 @@ public class TestCteExecution
                 "JOIN ORDERS o2 ON o1.orderkey = o2.orderkey) " +
                 "SELECT * FROM temp t1 ";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
     }
 
     @Test
@@ -570,9 +517,7 @@ public class TestCteExecution
                 "SELECT * FROM temp t1 JOIN temp t2 on " +
                 "t1.orderkey = t2.orderkey WHERE t1.orderkey < 10";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("temp", 2, false)));
     }
 
     @Test
@@ -581,9 +526,7 @@ public class TestCteExecution
         String testQuery = " WITH  temp as (SELECT * FROM ORDERS) " +
                 "SELECT * FROM temp t1";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
     }
 
     @Test
@@ -598,9 +541,8 @@ public class TestCteExecution
                 "   SELECT * FROM cte1" +
                 "   JOIN cte2 ON cte1.orderkey = cte2.custkey";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false),
+                new CTEInfoValue("cte2", 1, false)));
     }
 
     @Test
@@ -614,9 +556,8 @@ public class TestCteExecution
                 "   WHERE nationkey < 5)" +
                 "SELECT * FROM cte1";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 1, false),
+                new CTEInfoValue("cte2", 1, false)));
     }
 
     @Test
@@ -628,9 +569,7 @@ public class TestCteExecution
                 "   SELECT orderkey FROM ORDERS WHERE orderkey > 500)" +
                 "SELECT * FROM cte";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -641,9 +580,7 @@ public class TestCteExecution
                 "SELECT * FROM cte c1" +
                 " JOIN cte c2 ON c1.orderkey = c2.orderkey WHERE c1.orderkey < 100";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 2, false)));
     }
 
     @Test
@@ -654,9 +591,7 @@ public class TestCteExecution
                 "   FROM ORDERS)" +
                 "SELECT * FROM cte WHERE row <= 5";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -668,9 +603,9 @@ public class TestCteExecution
                 "     cte3 AS (SELECT * FROM cte1 WHERE orderkey >= 100)" +
                 "SELECT * FROM cte2 UNION ALL SELECT * FROM cte3";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 2, false),
+                new CTEInfoValue("cte2", 1, false),
+                new CTEInfoValue("cte3", 1, false)));
     }
 
     @Test
@@ -684,9 +619,7 @@ public class TestCteExecution
                 "ORDER BY total_spent DESC " +
                 "LIMIT 5";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery), true);
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -701,9 +634,7 @@ public class TestCteExecution
                 "SELECT * FROM cte " +
                 "WHERE total_supply_cost > 1000";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -718,9 +649,7 @@ public class TestCteExecution
                 "SELECT * FROM cte " +
                 "ORDER BY customer_name, order_year";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -733,9 +662,7 @@ public class TestCteExecution
                 "SELECT * FROM cte " +
                 "WHERE total_qty < 100";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte", 1, false)));
     }
 
     @Test
@@ -767,9 +694,12 @@ public class TestCteExecution
                 "    )" +
                 "SELECT * FROM cte6";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("cte1", 3, false),
+                        new CTEInfoValue("cte2", 2, false),
+                        new CTEInfoValue("cte3", 1, false),
+                        new CTEInfoValue("cte4", 1, false),
+                        new CTEInfoValue("cte5", 1, false),
+                        new CTEInfoValue("cte6", 1, false)));
     }
 
     @Test
@@ -796,9 +726,10 @@ public class TestCteExecution
                 "WHERE region_name = 'AMERICA' " +
                 "ORDER BY nation_name, custkey, orderdate";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("customer_nation", 1, false),
+                new CTEInfoValue("customer_orders", 1, false),
+                new CTEInfoValue("order_lineitems", 1, false),
+                new CTEInfoValue("customer_part_analysis", 1, false)));
     }
 
     @Test
@@ -826,9 +757,10 @@ public class TestCteExecution
                 "WHERE part_type LIKE '%BRASS' " +
                 "ORDER BY region_name, supplier_name";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("supplier_region", 1, false),
+                new CTEInfoValue("supplier_parts", 1, false),
+                new CTEInfoValue("parts_info", 1, false),
+                new CTEInfoValue("full_supplier_part_info", 1, false)));
     }
 
     @Test
@@ -856,9 +788,10 @@ public class TestCteExecution
                 "WHERE part_type LIKE '%BRASS' " +
                 "ORDER BY region_name, supplier_name";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(
-                queryRunner.execute(getMaterializedSession(), testQuery),
-                queryRunner.execute(getSession(), testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("supplier_region", 1, false),
+                new CTEInfoValue("supplier_parts", 1, false),
+                new CTEInfoValue("parts_info", 1, false),
+                new CTEInfoValue("full_supplier_part_info", 1, false)));
     }
 
     @Test
@@ -867,9 +800,12 @@ public class TestCteExecution
         QueryRunner queryRunner = getQueryRunner();
         try {
             // Create tables with Ctas
-            queryRunner.execute(getMaterializedSession(),
-                    "CREATE TABLE persistent_table as (WITH  temp as (SELECT orderkey FROM ORDERS) " +
-                            "SELECT * FROM temp t1 )");
+            Session materializedSession = getMaterializedSession();
+            String testQuery = "CREATE TABLE persistent_table as (WITH  temp as (SELECT orderkey FROM ORDERS) " +
+                    "SELECT * FROM temp t1 )";
+            verifyCTEExplainPlan(materializedSession, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
+            queryRunner.execute(materializedSession,
+                    testQuery);
             queryRunner.execute(getSession(),
                     "CREATE TABLE non_persistent_table as (WITH  temp as (SELECT orderkey FROM ORDERS) " +
                             "SELECT * FROM temp t1) ");
@@ -895,29 +831,36 @@ public class TestCteExecution
         QueryRunner queryRunner = getQueryRunner();
         try {
             // Create tables with Ctas
-            queryRunner.execute(getMaterializedSession(),
-                    "CREATE TABLE persistent_table as ( " +
-                            "WITH  supplier_region AS (" +
-                            "   SELECT s.suppkey, s.name AS supplier_name, n.name AS nation_name, r.name AS region_name " +
-                            "   FROM SUPPLIER s " +
-                            "   JOIN NATION n ON s.nationkey = n.nationkey " +
-                            "   JOIN REGION r ON n.regionkey = r.regionkey), " +
-                            " supplier_parts AS (" +
-                            "   SELECT sr.*, ps.partkey, ps.availqty, ps.supplycost " +
-                            "   FROM supplier_region sr " +
-                            "   JOIN partsupp ps ON sr.suppkey = ps.suppkey), " +
-                            "parts_info AS (" +
-                            "   SELECT sp.*, p.name AS part_name, p.type AS part_type, p.size AS part_size " +
-                            "   FROM supplier_parts sp " +
-                            "   JOIN PART p ON sp.partkey = p.partkey), " +
-                            " full_supplier_part_info AS (" +
-                            "   SELECT pi.*, n.comment AS nation_comment, r.comment AS region_comment " +
-                            "   FROM parts_info pi " +
-                            "   JOIN NATION n ON pi.nation_name = n.name " +
-                            "   JOIN REGION r ON pi.region_name = r.name) " +
-                            "SELECT * FROM full_supplier_part_info " +
-                            "WHERE part_type LIKE '%BRASS' " +
-                            "ORDER BY region_name, supplier_name)");
+            Session materializedSession = getMaterializedSession();
+            String testQuery = "CREATE TABLE persistent_table as ( " +
+                    "WITH  supplier_region AS (" +
+                    "   SELECT s.suppkey, s.name AS supplier_name, n.name AS nation_name, r.name AS region_name " +
+                    "   FROM SUPPLIER s " +
+                    "   JOIN NATION n ON s.nationkey = n.nationkey " +
+                    "   JOIN REGION r ON n.regionkey = r.regionkey), " +
+                    " supplier_parts AS (" +
+                    "   SELECT sr.*, ps.partkey, ps.availqty, ps.supplycost " +
+                    "   FROM supplier_region sr " +
+                    "   JOIN partsupp ps ON sr.suppkey = ps.suppkey), " +
+                    "parts_info AS (" +
+                    "   SELECT sp.*, p.name AS part_name, p.type AS part_type, p.size AS part_size " +
+                    "   FROM supplier_parts sp " +
+                    "   JOIN PART p ON sp.partkey = p.partkey), " +
+                    " full_supplier_part_info AS (" +
+                    "   SELECT pi.*, n.comment AS nation_comment, r.comment AS region_comment " +
+                    "   FROM parts_info pi " +
+                    "   JOIN NATION n ON pi.nation_name = n.name " +
+                    "   JOIN REGION r ON pi.region_name = r.name) " +
+                    "SELECT * FROM full_supplier_part_info " +
+                    "WHERE part_type LIKE '%BRASS' " +
+                    "ORDER BY region_name, supplier_name)";
+            verifyCTEExplainPlan(materializedSession, testQuery,
+                    ImmutableList.of(new CTEInfoValue("supplier_region", 1, false),
+                            new CTEInfoValue("supplier_parts", 1, false),
+                            new CTEInfoValue("parts_info", 1, false),
+                            new CTEInfoValue("full_supplier_part_info", 1, false)));
+            queryRunner.execute(materializedSession,
+                    testQuery);
             queryRunner.execute(getSession(),
                     "CREATE TABLE non_persistent_table as ( " +
                             "WITH  supplier_region AS (" +
@@ -970,10 +913,12 @@ public class TestCteExecution
                     "CREATE TABLE non_persistent_table (orderkey BIGINT)");
 
             // Insert data into tables using CTEs
-            queryRunner.execute(getMaterializedSession(),
-                    "INSERT INTO persistent_table " +
-                            "WITH  temp AS (SELECT orderkey FROM ORDERS) " +
-                            "SELECT * FROM temp");
+            Session materializedSession = getMaterializedSession();
+            String testQuery = "INSERT INTO persistent_table " +
+                    "WITH  temp AS (SELECT orderkey FROM ORDERS) " +
+                    "SELECT * FROM temp";
+            queryRunner.execute(materializedSession,
+                    testQuery);
             queryRunner.execute(getSession(),
                     "INSERT INTO non_persistent_table " +
                             "WITH temp AS (SELECT orderkey FROM ORDERS) " +
@@ -984,6 +929,7 @@ public class TestCteExecution
                             "SELECT * FROM persistent_table"),
                     queryRunner.execute(getSession(),
                             "SELECT * FROM non_persistent_table"));
+            verifyCTEExplainPlan(materializedSession, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
         }
         finally {
             // drop tables
@@ -1012,29 +958,31 @@ public class TestCteExecution
             queryRunner.execute(getSession(),
                     "CREATE TABLE non_persistent_table" + createTableBase);
 
-            queryRunner.execute(getMaterializedSession(),
-                    "INSERT INTO persistent_table  " +
-                            "WITH  supplier_region AS (" +
-                            "   SELECT s.suppkey, s.name AS supplier_name, n.name AS nation_name, r.name AS region_name " +
-                            "   FROM SUPPLIER s " +
-                            "   JOIN NATION n ON s.nationkey = n.nationkey " +
-                            "   JOIN REGION r ON n.regionkey = r.regionkey), " +
-                            " supplier_parts AS (" +
-                            "   SELECT sr.*, ps.partkey, ps.availqty, ps.supplycost " +
-                            "   FROM supplier_region sr " +
-                            "   JOIN partsupp ps ON sr.suppkey = ps.suppkey), " +
-                            "parts_info AS (" +
-                            "   SELECT sp.*, p.name AS part_name, p.type AS part_type, p.size AS part_size " +
-                            "   FROM supplier_parts sp " +
-                            "   JOIN PART p ON sp.partkey = p.partkey), " +
-                            " full_supplier_part_info AS (" +
-                            "   SELECT pi.*, n.comment AS nation_comment, r.comment AS region_comment " +
-                            "   FROM parts_info pi " +
-                            "   JOIN NATION n ON pi.nation_name = n.name " +
-                            "   JOIN REGION r ON pi.region_name = r.name) " +
-                            "SELECT * FROM full_supplier_part_info " +
-                            "WHERE part_type LIKE '%BRASS' " +
-                            "ORDER BY region_name, supplier_name");
+            Session materializedSession = getMaterializedSession();
+            String testQuery = "INSERT INTO persistent_table  " +
+                    "WITH  supplier_region AS (" +
+                    "   SELECT s.suppkey, s.name AS supplier_name, n.name AS nation_name, r.name AS region_name " +
+                    "   FROM SUPPLIER s " +
+                    "   JOIN NATION n ON s.nationkey = n.nationkey " +
+                    "   JOIN REGION r ON n.regionkey = r.regionkey), " +
+                    " supplier_parts AS (" +
+                    "   SELECT sr.*, ps.partkey, ps.availqty, ps.supplycost " +
+                    "   FROM supplier_region sr " +
+                    "   JOIN partsupp ps ON sr.suppkey = ps.suppkey), " +
+                    "parts_info AS (" +
+                    "   SELECT sp.*, p.name AS part_name, p.type AS part_type, p.size AS part_size " +
+                    "   FROM supplier_parts sp " +
+                    "   JOIN PART p ON sp.partkey = p.partkey), " +
+                    " full_supplier_part_info AS (" +
+                    "   SELECT pi.*, n.comment AS nation_comment, r.comment AS region_comment " +
+                    "   FROM parts_info pi " +
+                    "   JOIN NATION n ON pi.nation_name = n.name " +
+                    "   JOIN REGION r ON pi.region_name = r.name) " +
+                    "SELECT * FROM full_supplier_part_info " +
+                    "WHERE part_type LIKE '%BRASS' " +
+                    "ORDER BY region_name, supplier_name";
+            queryRunner.execute(materializedSession,
+                    testQuery);
             queryRunner.execute(getSession(),
                     "INSERT INTO non_persistent_table  " +
                             "WITH  supplier_region AS (" +
@@ -1064,6 +1012,11 @@ public class TestCteExecution
                             "SELECT * FROM persistent_table"),
                     queryRunner.execute(getSession(),
                             "SELECT * FROM non_persistent_table"));
+            verifyCTEExplainPlan(materializedSession, testQuery,
+                    ImmutableList.of(new CTEInfoValue("supplier_region", 1, false),
+                    new CTEInfoValue("supplier_parts", 1, false),
+                    new CTEInfoValue("parts_info", 1, false),
+                    new CTEInfoValue("full_supplier_part_info", 1, false)));
         }
         finally {
             // drop tables
@@ -1081,15 +1034,18 @@ public class TestCteExecution
 
         try {
             // Create views
-            queryRunner.execute(getMaterializedSession(),
+            Session materializedSession = getMaterializedSession();
+            queryRunner.execute(materializedSession,
                     "CREATE VIEW persistent_view AS WITH  temp AS (SELECT orderkey FROM ORDERS) " +
                             "SELECT * FROM temp");
             queryRunner.execute(getSession(),
                     "CREATE VIEW non_persistent_view AS WITH temp AS (SELECT orderkey FROM ORDERS) " +
                             "SELECT * FROM temp");
             // Compare contents of views with a select
-            compareResults(queryRunner.execute(getMaterializedSession(), "SELECT * FROM persistent_view"),
+            String testQuery = "SELECT * FROM persistent_view";
+            compareResults(queryRunner.execute(getMaterializedSession(), testQuery),
                     queryRunner.execute(getSession(), "SELECT * FROM non_persistent_view"));
+            verifyCTEExplainPlan(materializedSession, testQuery, ImmutableList.of(new CTEInfoValue("temp", 1, false)));
         }
         finally {
             // Drop views
@@ -1104,7 +1060,8 @@ public class TestCteExecution
         QueryRunner queryRunner = getQueryRunner();
         try {
             // Create Views
-            queryRunner.execute(getMaterializedSession(),
+            Session materializedSession = getMaterializedSession();
+            queryRunner.execute(materializedSession,
                     "CREATE View persistent_view as " +
                             "WITH  supplier_region AS (" +
                             "   SELECT s.suppkey, s.name AS supplier_name, n.name AS nation_name, r.name AS region_name " +
@@ -1152,10 +1109,16 @@ public class TestCteExecution
                             "ORDER BY region_name, supplier_name");
 
             // Compare contents with a select
+            String testQuery = "SELECT * FROM persistent_view";
             compareResults(queryRunner.execute(getMaterializedSession(),
-                            "SELECT * FROM persistent_view"),
+                            testQuery),
                     queryRunner.execute(getSession(),
                             "SELECT * FROM non_persistent_view"));
+            verifyCTEExplainPlan(materializedSession, testQuery,
+                    ImmutableList.of(new CTEInfoValue("supplier_region", 1, false),
+                            new CTEInfoValue("supplier_parts", 1, false),
+                            new CTEInfoValue("parts_info", 1, false),
+                            new CTEInfoValue("full_supplier_part_info", 1, false)));
         }
         finally {
             // drop views
@@ -1171,8 +1134,7 @@ public class TestCteExecution
         QueryRunner queryRunner = getQueryRunner();
         String query = "WITH  temp as (SELECT * FROM ORDERS) " +
                 "SELECT * FROM (select orderkey from temp) t JOIN (select custkey, orderkey as orderkey2 from temp) t2 ON t.orderkey=t2.orderkey2";
-        compareResults(queryRunner.execute(getMaterializedSession(), query),
-                queryRunner.execute(getSession(), query));
+        verifyResults(queryRunner, query, ImmutableList.of(new CTEInfoValue("temp", 2, false)));
     }
 
     @Test
@@ -1181,8 +1143,7 @@ public class TestCteExecution
         QueryRunner queryRunner = getQueryRunner();
         String query = "WITH  temp as (SELECT * FROM ORDERS) " +
                 "SELECT * FROM (select orderkey from temp where orderkey > 20) t JOIN (select custkey, orderkey as orderkey2 from temp where custkey < 1000) t2 ON t.orderkey=t2.orderkey2";
-        compareResults(queryRunner.execute(getMaterializedSession(), query),
-                queryRunner.execute(getSession(), query));
+        verifyResults(queryRunner, query, ImmutableList.of(new CTEInfoValue("temp", 2, false)));
     }
 
     @Test
@@ -1192,8 +1153,7 @@ public class TestCteExecution
         // one CTE consumer used without a filter: no filter pushdown
         String query = "WITH  temp as (SELECT * FROM ORDERS) " +
                 "SELECT * FROM (select orderkey from temp where orderkey > 20) t UNION ALL select orderkey from temp";
-        compareResults(queryRunner.execute(getMaterializedSession(), query),
-                queryRunner.execute(getSession(), query));
+        verifyResults(queryRunner, query, ImmutableList.of(new CTEInfoValue("temp", 2, false)));
     }
 
     @Test
@@ -1203,8 +1163,8 @@ public class TestCteExecution
         String query = "WITH cte1 AS (SELECT * FROM ORDERS WHERE orderkey < 1000), " +
                 "cte5 AS (SELECT orderkey FROM cte1 WHERE totalprice < 100000) " +
                 "SELECT * FROM cte5";
-        compareResults(queryRunner.execute(getMaterializedSession(), query),
-                queryRunner.execute(getSession(), query));
+        verifyResults(queryRunner, query, ImmutableList.of(new CTEInfoValue("cte1", 1, false),
+                new CTEInfoValue("cte5", 1, false)));
     }
 
     @Test
@@ -1227,10 +1187,34 @@ public class TestCteExecution
                 "t1 as ( select orderkey k from orders where orderkey < 10 ), t3 as ( select t1.k, t2.k from t1 left join t2 on t1.k=t2.k ) select * from t3 ) " +
                 "select * from t3 except select * from t4";
         QueryRunner queryRunner = getQueryRunner();
-        compareResults(queryRunner.execute(getMaterializedSession(),
-                        testQuery),
-                queryRunner.execute(getSession(),
-                        testQuery));
+        verifyResults(queryRunner, testQuery, ImmutableList.of(new CTEInfoValue("t1", 1, false),
+                new CTEInfoValue("t2", 1, false),
+                new CTEInfoValue("t3", 1, false),
+                new CTEInfoValue("t4", 1, false)));
+    }
+
+    private void verifyResults(QueryRunner queryRunner, String query, List<CTEInfoValue> expectedCTEInfoValues)
+    {
+        Session materializedSession = getMaterializedSession();
+        Session session = getSession();
+        verifyResults(materializedSession, session, queryRunner, query, expectedCTEInfoValues);
+    }
+
+    private void verifyResults(Session materializedSession, Session session, QueryRunner queryRunner, String query, List<CTEInfoValue> expectedCTEInfoValues)
+    {
+        compareResults(queryRunner.execute(materializedSession,
+                        query),
+                queryRunner.execute(session,
+                        query));
+        verifyCTEExplainPlan(materializedSession, query, expectedCTEInfoValues);
+    }
+
+    private void verifyCTEExplainPlan(Session materializedSession, String query, List<CTEInfoValue> expectedCTEInfoValues)
+    {
+        //Verify CTE Explain plan
+        MaterializedResult materializedResult = computeActual(materializedSession, "explain " + query);
+        String explain = (String) getOnlyElement(materializedResult.getOnlyColumnAsSet());
+        checkCTEInfoMatch(explain, expectedCTEInfoValues);
     }
 
     private void compareResults(MaterializedResult actual, MaterializedResult expected)
@@ -1242,12 +1226,24 @@ public class TestCteExecution
     {
         // Verify result count
         assertEquals(actual.getRowCount(),
-                expected.getRowCount(), String.format("Expected %d rows got %d rows", expected.getRowCount(), actual.getRowCount()));
+                expected.getRowCount(), format("Expected %d rows got %d rows", expected.getRowCount(), actual.getRowCount()));
         if (checkOrdering) {
             assertEquals(actual.getMaterializedRows(), expected.getMaterializedRows(), "Correctness check failed! Rows are not equal");
             return;
         }
         QueryAssertions.assertEqualsIgnoreOrder(actual, expected, "Correctness check failed! Rows are not equal");
+    }
+
+    private void checkCTEInfoMatch(String explain, List<CTEInfoValue> expectedCTEInfoValues)
+    {
+        Matcher matcher = CTE_INFO_MATCHER.matcher(explain);
+        assertTrue(matcher.find());
+
+        String cteInfo = matcher.group();
+        for (CTEInfoValue value : expectedCTEInfoValues) {
+            assertTrue(cteInfo.contains(value.name + ": " + value.frequency + " (is_view: " + value.isView + ")"),
+                    format("Explain plan %s missing expected CTEInfo for: %s", explain, value.name));
+        }
     }
 
     @Override
@@ -1261,9 +1257,24 @@ public class TestCteExecution
     protected Session getMaterializedSession()
     {
         return Session.builder(super.getSession())
+                .setSystemProperty(VERBOSE_OPTIMIZER_INFO_ENABLED, "true")
                 .setSystemProperty(PUSHDOWN_SUBFIELDS_ENABLED, "true")
                 .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
                 .setSystemProperty(CTE_FILTER_AND_PROJECTION_PUSHDOWN_ENABLED, "true")
                 .build();
+    }
+
+    public static class CTEInfoValue
+    {
+        String name;
+        int frequency;
+        boolean isView;
+
+        public CTEInfoValue(String name, int frequency, boolean isView)
+        {
+            this.name = name;
+            this.frequency = frequency;
+            this.isView = isView;
+        }
     }
 }
